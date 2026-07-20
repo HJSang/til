@@ -625,6 +625,406 @@ If knowledge-distillation logits are pending, their flush is scheduled after
 the checkpoint request. Success finalizers are moved to the logits request so
 the checkpoint is not reported successful until both outputs complete.
 
+### Worked example: GLM-Air on 512 B200 GPUs
+
+Consider this topology:
+
+```text
+Training:       64 nodes x 8 B200 = 512 GPUs
+TP:             4
+PP:             2
+EP:             8
+Dense DP:       64
+```
+
+The walkthrough uses these additional assumptions:
+
+```text
+Context parallelism (CP):       1
+Expert tensor parallelism:      4 (defaults to TP)
+Virtual pipeline parallelism:   disabled
+Checkpoint format:              torch_dist
+Async save:                     disabled
+Distributed optimizer:          enabled
+Optimizer checkpoint format:    dp_reshardable
+Optimizer CPU offload:          disabled
+Checkpoint iteration:           1000
+```
+
+These assumptions matter. CPU-offloaded optimizer state would start on host
+memory, virtual pipeline parallelism could give each process multiple model
+chunks, and a different rank order would change the global-rank formulas.
+
+#### Derive the dense and expert parallel dimensions
+
+Dense layers use TP, PP, and DP:
+
+```text
+dense model-parallel size = TP x PP
+                          = 4 x 2
+                          = 8 GPUs
+
+dense DP = world size / dense model-parallel size
+         = 512 / 8
+         = 64
+```
+
+Expert layers additionally use expert parallelism. With expert tensor
+parallelism defaulting to TP:
+
+```text
+expert model-parallel size = ETP x EP x PP
+                           = 4 x 8 x 2
+                           = 64 GPUs
+
+expert DP = world size / expert model-parallel size
+          = 512 / 64
+          = 8
+```
+
+`dense DP=64` and `EP=8` are not independent multiplicative dimensions.
+Instead, EP subdivides the dense DP coordinate:
+
+```text
+dense_dp = ep + EP * expert_dp
+         = ep + 8 * expert_dp
+```
+
+Consequently:
+
+| State | Unique model shards | Replication factor |
+|---|---:|---:|
+| Dense weights | `TP x PP = 8` | 64 dense-DP replicas |
+| Expert weights | `ETP x EP x PP = 64` | 8 expert-DP replicas |
+
+#### Map global ranks to parallel coordinates
+
+Megatron's default rank order is `tp-cp-ep-dp-pp`. The first coordinate is
+the fastest-changing coordinate. With CP=1, the dense rank generator has:
+
+```text
+global_rank = tp + TP * dense_dp + TP * dense_dp_size * pp
+            = tp + 4 * dense_dp + 256 * pp
+```
+
+The expert rank generator has:
+
+```text
+global_rank = etp + ETP * ep + ETP * EP * expert_dp
+              + ETP * EP * expert_dp_size * pp
+            = etp + 4 * ep + 32 * expert_dp + 256 * pp
+```
+
+Equating the two formulas gives:
+
+```text
+tp = etp
+dense_dp = ep + 8 * expert_dp
+ep = dense_dp % 8
+expert_dp = dense_dp // 8
+```
+
+Assume the launcher assigns eight consecutive global ranks to each node:
+
+```text
+node_index = global_rank // 8
+physical_gpu_on_node = global_rank % 8
+```
+
+The process usually selects `cuda:<local_rank>`. If the launcher gives each
+process a remapped `CUDA_VISIBLE_DEVICES`, the same physical GPU may appear
+inside the process as `cuda:0`.
+
+Representative ranks are:
+
+| Global rank | Physical placement | PP | TP/ETP | Dense DP | EP | Expert DP | Local weight identity |
+|---:|---|---:|---:|---:|---:|---:|---|
+| 0 | node 0, GPU 0 | 0 | 0 | 0 | 0 | 0 | Stage 0, TP shard 0, expert partition 0 |
+| 1 | node 0, GPU 1 | 0 | 1 | 0 | 0 | 0 | Stage 0, TP shard 1, expert partition 0 |
+| 4 | node 0, GPU 4 | 0 | 0 | 1 | 1 | 0 | Same dense shard as rank 0; different experts |
+| 32 | node 4, GPU 0 | 0 | 0 | 8 | 0 | 1 | Dense and expert weight replica of rank 0 |
+| 255 | node 31, GPU 7 | 0 | 3 | 63 | 7 | 7 | Last rank of pipeline stage 0 |
+| 256 | node 32, GPU 0 | 1 | 0 | 0 | 0 | 0 | Stage 1, TP shard 0, expert partition 0 |
+| 511 | node 63, GPU 7 | 1 | 3 | 63 | 7 | 7 | Last rank of pipeline stage 1 |
+
+For global rank 0, useful process groups are:
+
+```text
+TP group:        [0, 1, 2, 3]
+PP group:        [0, 256]
+Dense DP group:  [0, 4, 8, ..., 252]       # 64 ranks
+EP group:        [0, 4, 8, ..., 28]        # 8 expert partitions
+Expert DP group: [0, 32, 64, ..., 224]     # 8 expert replicas
+```
+
+The physical placement follows from the default rank order. Changing
+Megatron's rank order or the launcher's global-rank assignment changes the
+node/GPU table without changing the logical checkpoint algorithm.
+
+#### Enter `save_checkpoint` on all ranks
+
+All 512 processes call:
+
+```python
+save_checkpoint(
+    iteration=1000,
+    model=model,
+    optimizer=optimizer,
+    opt_param_scheduler=scheduler,
+    num_floating_point_operations_so_far=flops,
+    checkpointing_context=checkpointing_context,
+)
+```
+
+This is collective code. Calling it only on global rank 0 would omit shards
+and can deadlock collective operations.
+
+On global rank 0, before unwrapping, the local object is conceptually:
+
+```text
+[DistributedDataParallel(Float16Module(GLMStage0))]
+```
+
+After:
+
+```python
+model = unwrap_model(model)
+```
+
+it is:
+
+```text
+[GLMStage0]
+```
+
+The stage-0, TP-0, EP-0 parameters remain on node 0's GPU 0. No tensor is
+copied, gathered, or moved to CPU. On global rank 256, the equivalent local
+object is `GLMStage1` on node 32's GPU 0.
+
+With virtual pipeline parallelism disabled, PP=2 does not mean each process
+has two model objects. A process owns one of the two pipeline stages. PP peers
+collectively cover the full model.
+
+#### Select the global `torch_dist` path
+
+At this Megatron revision:
+
+```python
+args.use_dist_ckpt = args.ckpt_format != "torch"
+```
+
+Therefore:
+
+```python
+ckpt_type = CheckpointType.GLOBAL
+save_dir = "/checkpoints/glm-air"
+checkpoint_name = "/checkpoints/glm-air/iter_0001000"
+```
+
+The condition controlling state generation is:
+
+```python
+if (
+    not torch.distributed.is_initialized()
+    or ckpt_type != CheckpointType.LEGACY
+    or dp_rank == 0
+    or expt_dp_rank == 0
+):
+    state_dict = generate_state_dict(...)
+```
+
+Because `ckpt_type != LEGACY` is true, all 512 ranks enter. The
+`dp_rank == 0 or expt_dp_rank == 0` writer filtering applies only to legacy
+rank-file checkpoints.
+
+#### Build sharded model state without moving weights
+
+Each rank invokes its local model stage:
+
+```python
+model_sd = model[i].sharded_state_dict(
+    metadata=sharded_sd_metadata,
+)
+```
+
+A conceptual rank-0 entry is:
+
+```python
+ShardedTensor(
+    key="decoder.layers.0.mlp.linear_fc1.weight",
+    data=local_cuda_tensor,
+    dtype=local_cuda_tensor.dtype,
+    local_shape=(...),
+    global_shape=(...),
+    global_offset=(...),
+    replica_id=(...),
+)
+```
+
+At this point:
+
+```text
+local_cuda_tensor.device = node 0's GPU 0
+```
+
+`ShardedTensor` is a mapping between existing local data and its position in a
+logical global tensor. Creating it does not gather the global weight and does
+not create a CPU copy.
+
+The important replica relationships are:
+
+```text
+Rank 0 versus rank 4:
+  same PP=0 and TP=0 dense shard
+  different dense-DP replica
+  different EP partition, so expert weights differ
+
+Rank 0 versus rank 32:
+  same PP=0 and TP/ETP=0
+  same EP=0
+  different expert-DP replica
+  dense and expert model weights are replicas
+
+Rank 0 versus rank 256:
+  different PP stage
+  model weights cover different layers
+```
+
+#### Build sharded optimizer state
+
+Assuming the distributed optimizer is enabled without CPU offload:
+
+| Runtime value | Device before save | Distribution |
+|---|---|---|
+| bf16/fp16 model weights | CUDA | Dense DP or expert DP replicated |
+| FP32 main parameters | CUDA | Partitioned across the relevant DP group |
+| Adam first moment | CUDA | Partitioned across the relevant DP group |
+| Adam second moment | CUDA | Partitioned across the relevant DP group |
+| Gradients | CUDA | Runtime state, normally not checkpointed |
+| Scheduler and argument metadata | CPU/Python objects | Common state |
+
+For each `(PP, TP)` dense model shard, the 64 dense-DP ranks partition its
+distributed optimizer state:
+
+```text
+8 dense model shards x 64 DP optimizer partitions
+= 512 rank-local dense optimizer partitions
+```
+
+For each `(PP, ETP, EP)` expert model shard, eight expert-DP ranks partition
+its optimizer state:
+
+```text
+64 expert model shards x 8 expert-DP optimizer partitions
+= 512 rank-local expert optimizer partitions
+```
+
+Unlike model weights, distributed optimizer partitions are not simply 64 or 8
+identical replicas. Each rank owns checkpoint data needed to reconstruct the
+global optimizer state.
+
+#### Choose writers without moving GPU tensors between ranks
+
+With fully parallel saving, Megatron wraps the base strategy:
+
+```python
+save_strategy = FullyParallelSaveStrategyWrapper(
+    save_strategy,
+    dense_dp_group,
+    args.ckpt_assume_constant_structure,
+)
+```
+
+The wrapper exchanges metadata and uses a greedy distribution algorithm to
+choose which existing replica writes each model shard. It does not communicate
+weight data between GPUs.
+
+For example, ranks 0, 4, 8, and so on possess replicas of the same dense
+PP-0/TP-0 shard. The strategy selects an available replica as the main writer.
+For rank 0 and rank 32, either expert replica could be selected for their
+shared PP-0/ETP-0/EP-0 expert weights.
+
+The exact selected global rank cannot be inferred from topology alone. It
+depends on shard sizes, the greedy distribution, process group, and whether a
+previous distribution was cached.
+
+Non-selected replicas keep their training weights on CUDA but do not stage
+those replicas for checkpoint output. Unique optimizer partitions still need
+to be represented.
+
+#### Move selected data from CUDA to host memory
+
+All ranks enter:
+
+```python
+dist_checkpointing.save(
+    state_dict,
+    checkpoint_name,
+    save_strategy,
+    async_sharded_save=False,
+)
+```
+
+The synchronous `TorchDistSaveShardedStrategy.save` internally creates the
+same save request machinery used by async saving and executes it
+synchronously. Once planning determines which tensors a rank must write, the
+filesystem writer stages each selected CUDA tensor:
+
+```python
+cpu_tensor = tensor.to("cpu", non_blocking=True)
+torch.cuda.synchronize()
+```
+
+The placement transition for a selected rank is:
+
+```mermaid
+flowchart LR
+    A["Training parameter or optimizer shard<br/>CUDA on owning B200"]
+    -->|"temporary D2H copy"| B["Checkpoint staging tensor<br/>CPU host memory"]
+    -->|"filesystem write"| C["torch_dist shard<br/>shared checkpoint storage"]
+
+    A --> D["Original training tensor remains on CUDA"]
+```
+
+For a non-selected model replica:
+
+```text
+CUDA training weight -> remains on CUDA
+CPU checkpoint copy   -> not created for that replica
+filesystem write      -> not performed for that replica
+```
+
+The staging tensor is temporary. Saving does not replace the live CUDA model
+parameter with a CPU tensor.
+
+With optimizer CPU offload, some optimizer tensors would already reside on
+host memory and would not follow this exact device-to-host path. With async
+saving, staging and background-I/O timing also depends on the selected async
+strategy and `cpu_shm_mode`.
+
+#### Finalize and publish
+
+After every rank completes its assigned writes:
+
+1. The serializer finalizes distributed checkpoint metadata.
+2. Synchronous barriers ensure ranks observe completion.
+3. Global rank 0 writes:
+
+```text
+/checkpoints/glm-air/latest_checkpointed_iteration.txt
+```
+
+with:
+
+```text
+1000
+```
+
+Global rank 0 coordinates directory creation, common metadata, and tracker
+publication. It never gathers the complete 106B model. The checkpoint is one
+logical global state assembled from local CUDA shards, temporary host staging
+copies, and distributed storage writes.
+
 ## Code examples
 
 ### Minimal call-site pattern
@@ -811,6 +1211,11 @@ explains how optimizer shards are represented and resharded.
 - [Megatron Core: distributed save serialization](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/core/dist_checkpointing/serialization.py#L332-L396)
 - [Megatron-LM: async checkpoint queue](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/training/async_utils.py#L109-L154)
 - [Megatron-LM: async finalization in the training loop](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/training/training.py#L3635-L3654)
+- [Megatron-LM: parallel rank generation](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/core/parallel_state.py#L446-L521)
+- [Megatron-LM: dense and expert parallel dimensions](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/core/parallel_state.py#L730-L801)
+- [Megatron Core: `ShardedTensor` device and global-tensor mapping](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/core/dist_checkpointing/mapping.py#L51-L91)
+- [Megatron Core: fully parallel save distribution](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/core/dist_checkpointing/strategies/fully_parallel.py#L46-L139)
+- [Megatron Core: CUDA-to-CPU checkpoint staging](https://github.com/NVIDIA/Megatron-LM/blob/1c742862114775b3830523c6cd55f3b6e72b68dd/megatron/core/dist_checkpointing/strategies/filesystem_async.py#L114-L249)
 - [Megatron Core: Distributed Checkpointing](https://docs.nvidia.com/megatron-core/developer-guide/latest/api-guide/core/dist_checkpointing.html)
 - [PyTorch: Distributed Checkpoint API](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)
 - [PyTorch: Getting Started with Distributed Checkpoint](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html)
