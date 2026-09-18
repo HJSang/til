@@ -1,0 +1,93 @@
+name: Learning reminders
+
+on:
+  schedule:
+    # 9:00 PM PDT (04:00 UTC). See README for the standard-time caveat.
+    - cron: '0 4 * * *'
+    # 9:00 AM PDT Saturday (16:00 UTC).
+    - cron: '0 16 * * 6'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  daily:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 4 * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create today's learning issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          today="$(TZ=America/Los_Angeles date +%F)"
+          title="Daily learning — ${today}"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "Daily learning ${today} in:title" --json number --jq 'length')"
+          if [ "$existing" -gt 0 ]; then
+            echo "Issue already exists for ${today}; nothing to do."
+            exit 0
+          fi
+          cat > /tmp/daily-learning.md <<EOF
+          ## Handwrite first
+
+          - [ ] Handwrite one or more learnings before using AI.
+          - [ ] Capture something from work, reading, or a repository.
+          - [ ] Transcribe the note to \`daily/${today}.md\`.
+
+          ## Grammar-only check
+
+          - [ ] Use [GRAMMAR_ONLY.md](../blob/main/GRAMMAR_ONLY.md).
+          - [ ] Check grammar, spelling, and punctuation only.
+          - [ ] Keep the corrected text in your own voice and meaning.
+
+          ## Review
+
+          - [ ] Morning reread
+          - [ ] Before-sleep reread
+
+          Close this issue after committing the note.
+          EOF
+          gh label create daily-learning --repo "$GITHUB_REPOSITORY" --color 1d76db --description "Daily handwriting and learning note" --force >/dev/null 2>&1 || true
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label daily-learning --body-file /tmp/daily-learning.md
+
+  weekly:
+    if: github.event_name == 'schedule' && github.event.schedule == '0 16 * * 6'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create weekly review issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          today="$(TZ=America/Los_Angeles date +%F)"
+          title="Weekly learning review — ${today}"
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --search "Weekly learning review ${today} in:title" --json number --jq 'length')"
+          if [ "$existing" -gt 0 ]; then
+            echo "Review issue already exists for ${today}; nothing to do."
+            exit 0
+          fi
+          cat > /tmp/weekly-review.md <<EOF
+          ## Reread the last seven days
+
+          - [ ] I reread each daily note from the last seven days.
+          - [ ] I reread one older note.
+
+          ## Connections
+
+          What ideas, tools, or decisions connect across the week?
+
+          ## Gaps
+
+          What still feels unclear or easy to forget?
+
+          ## Next week
+
+          What is one small experiment, question, or practice to carry forward?
+
+          Close this issue after writing the review in the issue or a note.
+          EOF
+          gh label create weekly-review --repo "$GITHUB_REPOSITORY" --color 5319e7 --description "Weekly reread and reflection" --force >/dev/null 2>&1 || true
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label weekly-review --body-file /tmp/weekly-review.md
